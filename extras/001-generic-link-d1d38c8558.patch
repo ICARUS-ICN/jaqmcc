@@ -1,0 +1,251 @@
+diff --git a/daemon/face/generic-link-service.cpp b/daemon/face/generic-link-service.cpp
+index 239de43b..b6bf5ed3 100644
+--- a/daemon/face/generic-link-service.cpp
++++ b/daemon/face/generic-link-service.cpp
+@@ -27,6 +27,9 @@
+ 
+ #include <ndn-cxx/lp/pit-token.hpp>
+ #include <ndn-cxx/lp/tags.hpp>
++#include <ndn-cxx/util/random.hpp>
++#include <ns3/ndnSIM/model/ndn-net-device-transport.hpp>
++#include <ns3/queue.h>
+ 
+ #include <cmath>
+ 
+@@ -47,6 +50,10 @@ GenericLinkService::GenericLinkService(const GenericLinkService::Options& option
+   , m_lastSeqNo(-2)
+   , m_nextMarkTime(time::steady_clock::TimePoint::max())
+   , m_nMarkedSinceInMarkingState(0)
++  , m_linkId(ndn::random::generateSecureWord32())
++  , m_lastRateTransmission(time::steady_clock::TimePoint::min())
++  , m_lastByteCount(0)
++  , m_lastUpdatedRate(0)
+ {
+   m_reassembler.beforeTimeout.connect([this] (auto...) { ++this->nReassemblyTimeouts; });
+   m_reliability.onDroppedInterest.connect([this] (const auto& i) { this->notifyDroppedInterest(i); });
+@@ -242,47 +249,8 @@ GenericLinkService::assignSequences(std::vector<lp::Packet>& pkts)
+ 
+ void
+ GenericLinkService::checkCongestionLevel(lp::Packet& pkt)
+-{
+-  ssize_t sendQueueLength = getTransport()->getSendQueueLength();
+-  // The transport must support retrieving the current send queue length
+-  if (sendQueueLength < 0) {
+-    return;
+-  }
+-
+-  if (sendQueueLength > 0) {
+-    NFD_LOG_FACE_TRACE("txqlen=" << sendQueueLength << " threshold=" <<
+-                       m_options.defaultCongestionThreshold << " capacity=" <<
+-                       getTransport()->getSendQueueCapacity());
+-  }
+-
+-  // sendQueue is above target
+-  if (static_cast<size_t>(sendQueueLength) > m_options.defaultCongestionThreshold) {
+-    const auto now = time::steady_clock::now();
+-
+-    if (m_nextMarkTime == time::steady_clock::TimePoint::max()) {
+-      m_nextMarkTime = now + m_options.baseCongestionMarkingInterval;
+-    }
+-    // Mark packet if sendQueue stays above target for one interval
+-    else if (now >= m_nextMarkTime) {
+-      pkt.set<lp::CongestionMarkField>(1);
+-      ++nCongestionMarked;
+-      NFD_LOG_FACE_DEBUG("LpPacket was marked as congested");
+-
+-      ++m_nMarkedSinceInMarkingState;
+-      // Decrease the marking interval by the inverse of the square root of the number of packets
+-      // marked in this incident of congestion
+-      time::nanoseconds interval(static_cast<time::nanoseconds::rep>(
+-                                   m_options.baseCongestionMarkingInterval.count() /
+-                                   std::sqrt(m_nMarkedSinceInMarkingState + 1)));
+-      m_nextMarkTime += interval;
+-    }
+-  }
+-  else if (m_nextMarkTime != time::steady_clock::TimePoint::max()) {
+-    // Congestion incident has ended, so reset
+-    NFD_LOG_FACE_DEBUG("Send queue length dropped below congestion threshold");
+-    m_nextMarkTime = time::steady_clock::TimePoint::max();
+-    m_nMarkedSinceInMarkingState = 0;
+-  }
++{ 
++  pkt.set<lp::CongestionMarkField>(generateCongestionMark(pkt));
+ }
+ 
+ void
+@@ -521,5 +489,101 @@ GenericLinkService::decodeNack(const Block& netPkt, const lp::Packet& firstPkt,
+   this->receiveNack(nack, endpointId);
+ }
+ 
++uint64_t
++GenericLinkService::generateCongestionMark(const lp::Packet& pkt)
++{
++  uint64_t currentMark = 0;
++
++  if (pkt.has<lp::CongestionMarkField>()) {
++    currentMark = pkt.get<lp::CongestionMarkField>();
++  }
++
++  uint64_t newMark = currentMark; 
++
++  uint8_t currentCount = (currentMark & 0xFF000000) >> 24;
++  
++  std::bernoulli_distribution replace(1 / (currentCount + 1.));
++  std::bernoulli_distribution delayOrcount(0.5);
++
++  if (replace(ndn::random::getRandomNumberEngine())) {
++    // Replace ID
++    newMark = static_cast<uint64_t>(m_linkId) << 32;
++
++    // Update delay
++    if (delayOrcount(ndn::random::getRandomNumberEngine())) {
++      auto delay = m_delayEstimator.GetLastDelay().GetMicroSeconds();
++      delay = std::min(delay, (1L << 23) - 1);
++      assert(delay == (delay & 0x7FFFFF));
++      newMark |= delay;
++    }
++    else {
++      // Only update if we have sent a meaningful amount of traffic. 8 1250 byte packets, it's a
++      // minimum
++      if (getTransport()->getCounters().nOutBytes - m_lastByteCount > 10000) {
++        m_lastUpdatedRate = (getTransport()->getCounters().nOutBytes - m_lastByteCount)
++                            / static_cast<boost::chrono::duration<double>>(
++                                (time::steady_clock::now() - m_lastRateTransmission))
++                                .count();
++        NS_LOG_DEBUG("Duration: " << static_cast<boost::chrono::duration<double>>(
++                                       (time::steady_clock::now() - m_lastRateTransmission))
++                                       .count()
++                                  << " Bytes: "
++                                  << getTransport()->getCounters().nOutBytes - m_lastByteCount);
++
++        m_lastByteCount = getTransport()->getCounters().nOutBytes;
++        m_lastRateTransmission = time::steady_clock::now();
++      }
++
++      const uint8_t exp = std::max(0., ceil(log2(m_lastUpdatedRate) - 15));
++      const uint16_t characteristic = static_cast<uint64_t>(m_lastUpdatedRate) >> exp;
++      newMark |= exp;
++      newMark |= characteristic << 8;
++      newMark |= 0x800000; // Bit 24 is 1
++
++      NS_LOG_DEBUG("ID: " << m_linkId << " Value: " << m_lastUpdatedRate << " Characteristic: " << characteristic << "×2^" << static_cast<uint16_t>(exp));
++      if ((static_cast<uint64_t>(m_lastUpdatedRate) >> exp) > (1L<<15)) {
++        NS_LOG_WARN("Cannot encode such a high rate. Discarding: " << m_lastUpdatedRate);
++        return currentMark;
++      }
++    }
++  }
++
++  // Update counter
++  newMark &= 0xFFFFFFFF00FFFFFF; // Remove counter
++  assert(currentCount + 1 <= std::numeric_limits<uint8_t>::max());
++  newMark |= static_cast<uint64_t>(currentCount + 1) << 24;
++
++  return newMark;
++}
++
++void
++GenericLinkService::setFaceAndTransport(Face& face, Transport& transport)
++{
++  LinkService::setFaceAndTransport(face, transport);
++
++  // This is just a hack. Should be valid for every transport
++  ns3::ndn::NetDeviceTransport* ndtransport =
++    dynamic_cast<ns3::ndn::NetDeviceTransport*>(getTransport());
++
++  ns3::PointerValue txQueueAttribute;
++  if (ndtransport != nullptr && ndtransport->GetNetDevice()->GetAttributeFailSafe("TxQueue", txQueueAttribute)) {
++    ns3::Ptr<ns3::QueueBase> txQueue = txQueueAttribute.Get<ns3::QueueBase>();
++    txQueue->TraceConnectWithoutContext("Enqueue", ns3::MakeBoundCallback(enqueueTraffic, this));
++    txQueue->TraceConnectWithoutContext("Dequeue", ns3::MakeBoundCallback(dequeueTraffic, this));
++  }
++}
++
++void
++GenericLinkService::enqueueTraffic(const GenericLinkService* link, ns3::Ptr<const ns3::Packet> packet)
++{
++  link->m_delayEstimator.PrepareTx(packet);
++}
++
++void
++GenericLinkService::dequeueTraffic(GenericLinkService* link, ns3::Ptr<const ns3::Packet> packet)
++{
++  link->m_delayEstimator.RecordRx(packet);
++}
++
+ } // namespace face
+ } // namespace nfd
+diff --git a/daemon/face/generic-link-service.hpp b/daemon/face/generic-link-service.hpp
+index 64a2d3c1..6e96b1a6 100644
+--- a/daemon/face/generic-link-service.hpp
++++ b/daemon/face/generic-link-service.hpp
+@@ -33,6 +33,8 @@
+ 
+ #include <ndn-cxx/lp/tags.hpp>
+ 
++#include <ns3/delay-jitter-estimation.h>
++
+ namespace nfd {
+ namespace face {
+ 
+@@ -177,6 +179,12 @@ public:
+   void
+   setOptions(const Options& options);
+ 
++  /** \brief set Face and Transport for LinkService
++   *  \pre setFaceAndTransport has not been called
++   */
++  void
++  setFaceAndTransport(Face& face, Transport& transport) override;
++
+   const Counters&
+   getCounters() const OVERRIDE_WITH_TESTS_ELSE_FINAL;
+ 
+@@ -295,8 +303,14 @@ private: // receive path
+   void
+   decodeNack(const Block& netPkt, const lp::Packet& firstPkt, const EndpointId& endpointId);
+ 
+-PROTECTED_WITH_TESTS_ELSE_PRIVATE:
+-  Options m_options;
++  uint64_t
++  generateCongestionMark(const lp::Packet& pkt);
++
++  static void enqueueTraffic(const GenericLinkService* link, ns3::Ptr<const ns3::Packet> packet);
++
++  static void dequeueTraffic(GenericLinkService* link, ns3::Ptr<const ns3::Packet> packet);
++
++  PROTECTED_WITH_TESTS_ELSE_PRIVATE : Options m_options;
+   LpFragmenter m_fragmenter;
+   LpReassembler m_reassembler;
+   LpReliability m_reliability;
+@@ -308,6 +322,17 @@ PUBLIC_WITH_TESTS_ELSE_PRIVATE:
+   /// number of marked packets in the current incident of congestion
+   size_t m_nMarkedSinceInMarkingState;
+ 
++  /// random link ID to discern congestion information at the ends
++  uint32_t m_linkId;
++
++  /// Delay estimator
++  ns3::DelayJitterEstimation m_delayEstimator;
++
++  /// Rate estimation
++  time::steady_clock::TimePoint m_lastRateTransmission;
++  uint64_t m_lastByteCount;
++  uint64_t m_lastUpdatedRate;
++
+   friend class LpReliability;
+ };
+ 
+diff --git a/daemon/face/link-service.hpp b/daemon/face/link-service.hpp
+index abb34051..7fab45b4 100644
+--- a/daemon/face/link-service.hpp
++++ b/daemon/face/link-service.hpp
+@@ -88,7 +88,7 @@ public:
+   /** \brief set Face and Transport for LinkService
+    *  \pre setFaceAndTransport has not been called
+    */
+-  void
++  virtual void
+   setFaceAndTransport(Face& face, Transport& transport);
+ 
+   /** \return Face to which this LinkService is attached

@@ -1,0 +1,8 @@
+*.pyc
+.waf3-*
+.waf-1*
+*~
+build/
+.lock*
+.cache
+.vscode
