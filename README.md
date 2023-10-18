@@ -1,8 +1,9 @@
 Simulation Scenarios for a Joint AQM and Congestion Control Algorithm
 ===
 
-This is the supporting code and simulation scenarios described in a forthcoming
-paper currently under consideration for publication.
+This is the supporting code and simulation scenarios described in [End-to-end
+Active Queue Management with Named-Data
+Networking](https://netlab.det.uvigo.es/publication/e2e-aqm-ndn-23/).
 
 Usage
 ---
