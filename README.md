@@ -1,6 +1,8 @@
 Simulation Scenarios for a Joint AQM and Congestion Control Algorithm
 ===
 
+[![DOI](https://zenodo.org/badge/595252721.svg)](https://zenodo.org/doi/10.5281/zenodo.10925813)
+
 This is the supporting code and simulation scenarios described in [End-to-end
 Active Queue Management with Named-Data
 Networking](https://netlab.det.uvigo.es/publication/e2e-aqm-ndn-23/).
